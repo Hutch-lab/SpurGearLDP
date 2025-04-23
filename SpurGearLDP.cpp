@@ -1,12 +1,15 @@
 ﻿/* Physics 5810 - Computational Physics Final Project - Nick Hutchison */
 /*  Spur Gear Load Distribution Program */
+#include "FunctDefs.h"
 #define _USE_MATH_DEFINES
+#include <vector>
 #include <cmath>
-#include "FunctDefs2.h"
 #include <iostream>
 #include <iomanip>
-#include <vector>
 #include <tuple>
+#include <fstream>
+//#include <gsl/gsl_interp.h>
+//#include <gsl/gsl_spline.h>
 using namespace std;
 
 /*
@@ -17,13 +20,131 @@ f4 = m_gear * x_gear_doubledot
 f5 = m_gear * y_gear_doubledot
 f6 = momentInertia_gear * phi_gear_doubledot
 */
-#define f1(F_pinion_sx, F_pinion_1x, F_pinion_2x, F_pinion_3x, F_pinion_4x) (F_pinion_sx - F_pinion_1x - F_pinion_2x - F_pinion_3x - F_pinion_4x)
-#define f2(F_pinion_sy, F_pinion_1y, F_pinion_2y, F_pinion_3y, F_pinion_4y) (F_pinion_sy - F_pinion_1y - F_pinion_2y - F_pinion_3y - F_pinion_4y) - m_pinion * g
-#define f3(T_pinion_1, T_pinion_2, T_pinion_3, T_pinion_4, T_d) (T_pinion_1 + T_pinion_2 + T_pinion_3 + T_pinion_4 + T_d)
-#define f4(F_gear_sx, F_gear_1x, F_gear_2x, F_gear_3x, F_gear_4x) (F_gear_sx - F_gear_1x - F_gear_2x - F_gear_3x - F_gear_4x)
-#define f5(F_gear_sy, F_gear_1y, F_gear_2y, F_gear_3y, F_gear_4y) (F_gear_sy - F_gear_1y - F_gear_2y - F_gear_3y - F_gear_4y - m_gear * g)
-#define f6(T_gear_1, T_gear_2, T_gear_3, T_gear_4, T_l) (T_gear_1 + T_gear_2 + T_gear_3 + T_gear_4 + T_l)
 
+int main() {
+    SpurGear pinion;
+    SpurGear gear;
+    DynamicsVars dynvars;
+    startupmsg();
+    cout << endl;
+    dynvars.g = 9.80665;
+    dynvars.frictionCoeff = FRICTION_COEFF;
+    dynvars.v0_friction = V0_FRICTION_SI;
+    dynvars.vL_friction = VL_FRICTION_SI;
+    dynvars.deltaJudgmentThreshold = CONTACT_THRESHOLD_SI * 1000.0;
+    dynvars.stepCounter = 0; // Initialize debug counter
+
+    int method;
+    cout << " Enter 0 to manually enter parameters or 1 to load parameters from file: ";
+    cin >> method;
+    if (method == 0) { if (!getUserInput(&pinion, &gear)) { cerr << "Failed input.\n"; return 1; } }
+    else if (method == 1) { cout << "Read from file not implemented.\n"; return 1; }
+    else { cout << "Invalid input method.\n"; return 1; }
+    if (!setupProfiles(&pinion, &gear, &dynvars)) { cerr << "Failed setup.\n"; return 1; }
+    initialToothPinion(&pinion, &dynvars); initialToothGear(&gear, &dynvars);
+    completePinionProfile(&pinion, &dynvars); completeGearProfile(&gear, &dynvars);
+
+    double density = 7.85 / 1.0e6; // g/cm^3 -> kg/mm^3
+
+    double pinion_volume = M_PI * pow(pinion.pitchRadius, 2) * pinion.faceWidth; // mm^3
+    pinion.mass = pinion_volume * density; // kg
+    pinion.momentInertia = 0.5 * pinion.mass * pow(pinion.pitchRadius / 1000.0, 2); // kg*m^2
+
+    double gear_volume = M_PI * pow(gear.pitchRadius, 2) * gear.faceWidth;
+    gear.mass = gear_volume * density;
+    gear.momentInertia = 0.5 * gear.mass * pow(gear.pitchRadius / 1000.0, 2);
+
+    cout << "  Estimated Pinion Mass: " << pinion.mass << " kg, Inertia: " << pinion.momentInertia << " kg*m^2" << endl;
+    cout << "  Estimated Gear Mass:   " << gear.mass << " kg, Inertia: " << gear.momentInertia << " kg*m^2" << endl;
+
+    pinion.elasticCoeff = 1.0e7;
+    pinion.dampingCoeff = 5.0e3;
+    gear.elasticCoeff = 1.0e7;
+    gear.dampingCoeff = 5.0e3;
+    cout << "  Using Support K=" << pinion.elasticCoeff << " N/m, C=" << pinion.dampingCoeff << " Ns/m" << endl;
+    dynvars.meshStiffness = MESH_STIFFNESS_SI;
+    dynvars.meshDampingCoeff = getMeshDampingCoeff(dynvars.meshStiffness, MESH_DAMPING_RATIO, pinion.mass, gear.mass);
+    cout << "  Using Mesh Kv=" << dynvars.meshStiffness << " N/m, Cd=" << dynvars.meshDampingCoeff << " Ns/m (zeta=" << MESH_DAMPING_RATIO << ")" << endl;
+
+    // Initialize dynamic stress profile vector
+    if (dynvars.n > 0) {
+        pinion.contactStressProfile.assign(dynvars.n, 0.0); // Initialize with zeros
+    }
+    else {
+        cerr << "Error: dynvars.n is zero or negative, cannot initialize stress profile." << endl;
+        return 1;
+    }
+    cout << "\nInitialized Peak Dynamic Stress Profile vector (size " << dynvars.n << ") with zeros." << endl;
+
+    // Static Stress Calc
+    /* cout << "\nCalculating representative contact stress profile..." << endl;
+    double pitchRadius_m = pinion.pitchRadius / 1000.0; double Wt_static = 0.0; if (abs(pitchRadius_m) > 1e-9) { Wt_static = pinion.torque / pitchRadius_m; }
+    double omega_pinion_static = pinion.rpmSpeed * (2.0 * M_PI) / 60.0; double V_static = omega_pinion_static * pitchRadius_m;
+    cout << "  Representative Static Tangential Load (Wt): " << Wt_static << " N" << endl; cout << "  Representative Pitch Line Velocity (V): " << V_static << " m/s" << endl;
+    double Ko = 1.25; int Qv = 8; int gearQuality = 8; double Ks = 1.0; double ZR = 1.0;
+    cout << "  Using Factors: Ko=" << Ko << ", Qv=" << Qv << ", Quality=" << gearQuality << ", Ks=" << Ks << ", ZR=" << ZR << endl;
+    if (dynvars.n <= 0) { return 1; } pinion.contactStressProfile.resize(dynvars.n);
+    cout << "  Calculating stress for " << dynvars.n << " points on the profile..." << endl;
+    for (int j = 0; j < dynvars.n; ++j) { pinion.contactStressProfile[j] = calcContactStress(&pinion, &gear, Wt_static, V_static, Ko, Qv, gearQuality, Ks, ZR); if (pinion.contactStressProfile[j] < 0) { pinion.contactStressProfile[j] = 0; } }
+    cout << "  Calculated Contact Stress Profile (MPa): [";
+    for (int j = 0; j < dynvars.n; ++j) { cout << fixed << setprecision(2) << pinion.contactStressProfile[j] << (j == dynvars.n - 1 ? "" : ", "); } cout << "]" << endl;
+    */
+    // Dynamic Simulation
+    State state; state.pos[0] = 0;
+    state.pos[1] = 0;
+    state.pos[2] = 0;
+    state.pos[3] = pinion.centerDistance;
+    state.pos[4] = 0;
+    state.pos[5] = 0;
+    double omega_pinion_init = pinion.rpmSpeed * (2.0 * M_PI) / 60.0;
+    state.vel[0] = 0;
+    state.vel[1] = 0;
+    state.vel[2] = omega_pinion_init;
+    state.vel[3] = 0;
+    state.vel[4] = 0;
+    state.vel[5] = -omega_pinion_init / pinion.gearRatio;
+    double t = 0.0;
+    double dt = 5e-7;
+    double pinion_period = 1.0;
+    if (abs(pinion.rpmSpeed) > 1e-6) {
+        pinion_period = 1.0 / (pinion.rpmSpeed / 60.0);
+    }
+    else { pinion_period = 1.0; }
+    double t_final = 2 * pinion_period;
+    int steps = static_cast<int>(ceil(t_final / dt));
+    cout << "\nRunning dynamic simulation for " << t_final << " s (" << steps << " steps with dt=" << dt << ")..." << endl;
+    ofstream outfile("dynamics_output.txt"); outfile << "Time\t\tPinX\t\tPinY\t\tPinPhi\t\tGearX\t\tGearY\t\tGearPhi\t\tPinVelX\t\tPinVelY\t\tPinVelPhi\tGearVelX\tGearVelY\tGearVelPhi" << endl; outfile << fixed << setprecision(8);
+    moveGearPosition(state, &pinion, &gear, &dynvars);
+    for (int i = 0; i < steps; i++) {
+        state = rungeKuttaStep(state, t, dt, pinion, gear, dynvars);
+        t += dt;
+        if (i % (steps > 1000 ? steps / 100 : 10) == 0 || i == steps - 1) { // Adjust output frequency
+            cout << "Time: " << fixed << setprecision(7) << t << " | PinPhi(deg): " << fixed << setprecision(2) << state.pos[2] * 180.0 / M_PI << " | GearPhi(deg): " << fixed << setprecision(2) << state.pos[5] * 180.0 / M_PI << " | PinVelPhi: " << fixed << setprecision(2) << state.vel[2] << " | GearVelPhi: " << fixed << setprecision(2) << state.vel[5] << endl;
+            outfile << t; for (int k = 0; k < 6; ++k) outfile << "\t" << state.pos[k]; for (int k = 0; k < 6; ++k) outfile << "\t" << state.vel[k]; outfile << endl;
+
+            // Check for NaN/Inf and stop if unstable
+            bool unstable = false;
+            for (int k = 0; k < 6; ++k) { if (isnan(state.pos[k]) || isinf(state.pos[k]) || isnan(state.vel[k]) || isinf(state.vel[k])) { unstable = true; break; } }
+            if (unstable) {
+                cerr << "Error: Simulation became unstable at t = " << t << endl;
+                break; // Exit loop
+            }
+        }
+    }
+    outfile.close();
+    // Print Final Peak Dynamic Stress Profile
+    cout << "\nFinal Peak Dynamic Contact Stress Profile (MPa):" << endl;
+    cout << "Point Index | Stress (MPa)" << endl;
+    cout << "---------------------------" << endl;
+    for (size_t j = 0; j < pinion.contactStressProfile.size(); ++j) {
+        cout << setw(11) << j << " | " << fixed << setprecision(2) << setw(12) << pinion.contactStressProfile[j] << endl;
+    }
+    cout << "---------------------------" << endl;
+    cout << "(Remember: Contact detection and stiffness are simplified.)" << endl;
+    return 0;
+}
+
+/*
 int main() {
     SpurGear pinion;
     SpurGear gear;
@@ -31,6 +152,15 @@ int main() {
 
     startupmsg();
     cout << endl;
+
+    // Initialize dynamic parameters in dynvars
+    dynvars.g = 9.80665; // m/s^2
+    dynvars.frictionCoeff = FRICTION_COEFF;
+    dynvars.v0_friction = V0_FRICTION_SI;
+    dynvars.vL_friction = VL_FRICTION_SI;
+    dynvars.deltaJudgmentThreshold = CONTACT_THRESHOLD_SI * 1000.0;
+    dynvars.meshDampingCoeff = getMeshDampingCoeff(MESH_STIFFNESS_SI, MESH_DAMPING_RATIO, 1.0, 2.0) / 1000.0;
+    dynvars.stepCounter = 0;
 
     // Get input method
     int method;
@@ -42,66 +172,127 @@ int main() {
     }
     else if (method == 1) {
         // add read from file
+        cout << "Read from file not implemented yet." << endl;
+        return 1;
     }
     else {
         cout << "Input Error";
+        return 1;
     }
     // Setup involute shape for the pinion and gear
     setupProfiles(&pinion, &gear, &dynvars);
+    cout << "setupProfiles worked!" << endl;
     initialToothPinion(&pinion, &dynvars);
+    cout << "initialToothPinion worked!" << endl;
     initialToothGear(&gear, &dynvars);
+    cout << "initialToothGear worked!" << endl;
 
     // Copy the tooth profile for every tooth
     completePinionProfile(&pinion, &dynvars);
     completeGearProfile(&gear, &dynvars);
 
-    // Compute meshing line and contact points
-    meshingLine(&pinion, &gear, &dynvars);
+    // Best guess at gear weight
+    double density = 7.85e-9; // kg/mm^3 (8620 steel density)
+    double pinion_volume = M_PI * pow(pinion.pitchRadius, 2) * pinion.faceWidth; // mm^3
+    pinion.mass = pinion_volume * density; // kg
+    pinion.momentInertia = 0.5 * pinion.mass * pow(pinion.pitchRadius / 1000.0, 2); // kg*m^2
 
-    State state;
-    // Initialize state to zeros
-    for (int i = 0; i < 6; i++) {
-        state.pos[i] = 0.0;
-        state.vel[i] = 0.0;
+    double gear_volume = M_PI * pow(gear.pitchRadius, 2) * gear.faceWidth; // mm^3
+    gear.mass = gear_volume * density; // kg
+    gear.momentInertia = 0.5 * gear.mass * pow(gear.pitchRadius / 1000.0, 2); // kg*m^2
+
+    // Calculate Contact Stress @ static
+    cout << "\nCalculating contact stress at static cond." << endl;
+    double pitchRadius_m = pinion.pitchRadius / 1000.0; // Convert mm to m
+    double Wt_static = pinion.torque / pitchRadius_m; // N
+    cout << "  Static Tangential Load (Wt): " << Wt_static << " N" << endl;
+    double omega_pinion = pinion.rpmSpeed * (2.0 * M_PI) / 60.0; // rad/s
+    double V_static = omega_pinion * pitchRadius_m; // m/s
+    cout << "  Pitch Line Velocity (V): " << V_static << " m/s" << endl;
+
+    // Define stiffness / damping parameters
+    pinion.elasticCoeff = 1.0e7; // N/m
+    pinion.dampingCoeff = 5.0e3; // Ns/m
+    gear.elasticCoeff = 1.0e7; // N/m
+    gear.dampingCoeff = 5.0e3; // Ns/m
+    dynvars.meshDampingCoeff = getMeshDampingCoeff(MESH_STIFFNESS_SI, MESH_DAMPING_RATIO, pinion.mass, gear.mass); // Ns/m
+    dynvars.meshDampingCoeff /= 1000.0; // Convert Ns/m to Ns/mm for computeContactForce if it expects mm/s velocity
+
+    // Define parameters for contact stress calculation
+    double Ko = 1.25; // Overload factor (1.0=uniform, 1.25=light shock, 1.5=moderate, 1.75+=heavy)
+    int Qv = 8;       // Transmission Accuracy Level (e.g., 6-11, lower is better)
+    int gearQuality = 8; // AGMA Quality Number (e.g., 6-12)
+    double Ks = 1.0;  // Size Factor (often 1.0 for contact stress)
+    double ZR = 1.0;  // Surface Condition Factor (1.0 for typical surface finish)
+
+    cout << "  Using Factors: Ko=" << Ko << ", Qv=" << Qv << ", Quality=" << gearQuality << ", Ks=" << Ks << ", ZR=" << ZR << endl;
+
+    // This static calculation isn't representative of what actually occurs, kinda a gross oversimplification
+    pinion.contactStressProfile.resize(dynvars.n);
+    cout << "  Calculating stress for " << dynvars.n << " points on the profile..." << endl;
+    for (int j = 0; j < dynvars.n; ++j) {
+        // Call the stress function using the representative static values
+        pinion.contactStressProfile[j] = calcContactStress(&pinion, &gear, Wt_static, V_static, Ko, Qv, gearQuality, Ks, ZR);
     }
+
+    // Dynamic Simulation
+    State state;
+    // Initialize position and velocity states
+    state.pos[0] = 0.0; state.pos[1] = 0.0; state.pos[2] = 0.0;
+    state.pos[3] = pinion.centerDistance; state.pos[4] = 0.0; state.pos[5] = 0.0;
+    state.vel[0] = 0.0; state.vel[1] = 0.0; state.vel[2] = omega_pinion;
+    state.vel[3] = 0.0; state.vel[4] = 0.0; state.vel[5] = -omega_pinion / pinion.gearRatio;
+
     double t = 0.0;
-    double dt = 0.001;  // Time step (adjust as needed)
-    int steps = 100;   // Number of simulation steps
+    double dt = 5.0e-7;  // Time step (adjust as needed)
+    double pinion_period = 1.0 / (pinion.rpmSpeed / 60.0);
+    double t_final = 5.0 * pinion_period;
+    int steps = static_cast<int>(ceil(t_final / dt));
 
     cout << "\nRunning dynamic simulation:" << endl;
+    ofstream outfile("dynamics_output.txt");
+    outfile << "Time\tPinX\tPinY\tPinPhi\tGearX\tGearY\tGearPhi\tPinVelX\tPinVelY\tPinVelPhi\tGearVelX\tGearVelY\tGearVelPhi" << endl;
+    outfile << fixed << setprecision(8);
     for (int i = 0; i < steps; i++) {
+            t += dt;
+        //moveGearPosition(state, &pinion, &gear, &dynvars); // update tooth coords
         // Advance state using Runge-Kutta integration.
-        state = rungeKuttaStep(state, t, dt, pinion, gear);
-        t += dt;
-        
-        moveGearPosition(state, &pinion, &gear, &dynVars); // Update the current tooth profiles based on the new state.
+        state = rungeKuttaStep(state, t, dt, pinion, gear, dynvars);
+        dynvars.phi_k = state.pos[2];
 
-        // Output some state information.
-        cout << "Time: " << t
-            << " | Pinion pos: (" << state.pos[0] << ", " << state.pos[1] << ")"
-            << " | Gear pos: (" << state.pos[3] << ", " << state.pos[4] << ")" << endl;
+        if (i % (steps / 100) == 0 || i == steps - 1) {
+            // Output full state to file
+            outfile << t;
+            for (int k = 0; k < 6; ++k) outfile << "\t" << state.pos[k];
+            for (int k = 0; k < 6; ++k) outfile << "\t" << state.vel[k];
+            outfile << endl;
+        }
     }
 
-    cout << "\nSimulation complete." << endl;
+    cout << "Simulation complete, Output saved to dynamics_output.txt" << endl;
     return 0;
 }
-
+*/
 
 void startupmsg() {
-    cout << " Physics 5810 - Computational Physics Final Project ";
-    cout << " ----------------- Nick Hutchison ----------------- ";
-    cout << " ------ Spur Gear Load Distribution Program ------- ";
+    cout << " Physics 5810 - Computational Physics Final Project " << endl;
+    cout << " ----------------- Nick Hutchison ----------------- " << endl;
+    cout << " ------ Spur Gear Load Distribution Program ------- " << endl;
 }
 
-int getUserInput(SpurGear *pinion, SpurGear *gear){
+int getUserInput(SpurGear* pinion, SpurGear* gear) {
     /*
-
     Returns 0 when the user wants to exit and 1 if the user enters valid input data.
 
-    INPUT:  
-    OUTPUT: 
-    CALLS: 	
+    INPUT:
+    OUTPUT:
+    CALLS:
      */
+     /*
+    cout << "Enter speed of pinion (rpm): ";
+    cin >> pinion->rpmSpeed;
+    cout << "Enter torque applied to pinion (Nm): ";
+    cin >> pinion->torque;
     cout << "Enter number of teeth for the pinion and gear: ";
     cin >> pinion->numTeeth >> gear->numTeeth;
     cout << "Enter module: ";
@@ -129,49 +320,144 @@ int getUserInput(SpurGear *pinion, SpurGear *gear){
     cin >> pinion->youngsModulus >> gear->youngsModulus;
     cout << "Enter the Poissons ratio of the pinion and gear: ";
     cin >> pinion->poissonsRatio >> gear->poissonsRatio;
+        */
+    pinion->rpmSpeed = 2000;
+    pinion->torque = 50;
+    pinion->numTeeth = 30.0;
+    gear->numTeeth = 50.0;
+    pinion->pressureAngle = 20.0;
+    gear->pressureAngle = pinion->pressureAngle;
+    //pinion->rootDiameter = 40.0;
+    //gear->rootDiameter = 70.0;
+    pinion->centerDistance = 0.0;
+    pinion->faceWidth = 20.0;
+    gear->faceWidth = 20.0;
+    gear->offsetFaceWidth = 0.0;
+    pinion->module = 2.5;
+    gear->module = pinion->module;
+    pinion->gearQuality = 8;
+    pinion->Ko = 1.25;
+    pinion->Ks = 1.0;
+    pinion->ZR = 1.0;
+    pinion->Qv = 8;
 
-    if (pinion->centerDistance == 0) {
-        double cd = (gear->pitchDiameter + pinion->pitchDiameter) / 2;
+    pinion->addendum = 1.0 * pinion->module;
+    gear->addendum = 1.0 * gear->module;
+
+    pinion->dedendum = 1.25 * pinion->module;
+    gear->dedendum = 1.25 * gear->module;
+
+    pinion->gearRatio = gear->numTeeth / pinion->numTeeth;
+    gear->gearRatio = pinion->gearRatio;
+    pinion->pitchDiameter = pinion->numTeeth * pinion->module;
+    gear->pitchDiameter = gear->numTeeth * gear->module;
+    pinion->baseDiameter = pinion->pitchDiameter * cos(M_PI / 180.0 * pinion->pressureAngle);
+    gear->baseDiameter = gear->pitchDiameter * cos(M_PI / 180.0 * gear->pressureAngle);
+    pinion->outsideDiameter = pinion->pitchDiameter + 2 * pinion->addendum;
+    gear->outsideDiameter = gear->pitchDiameter + 2 * gear->addendum;
+    pinion->pitchRadius = pinion->pitchDiameter / 2.0;
+    gear->pitchRadius = gear->pitchDiameter / 2.0;
+    pinion->baseRadius = pinion->baseDiameter / 2.0;
+    gear->baseRadius = gear->baseDiameter / 2.0;
+    pinion->outsideRadius = pinion->outsideDiameter / 2.0;
+    gear->outsideRadius = gear->outsideDiameter / 2.0;
+
+    pinion->poissonsRatio = 0.28;
+    gear->poissonsRatio = pinion->poissonsRatio;
+    pinion->youngsModulus = 530.0e3; // MPa
+    gear->youngsModulus = pinion->youngsModulus;
+
+    if (pinion->centerDistance == 0.0) {
+        // Calculate the nominal center distance between gears
+        double cd = (gear->pitchDiameter + pinion->pitchDiameter) / 2.0;
         gear->centerDistance = cd;
         pinion->centerDistance = cd;
     }
-    pinion->gearRatio = gear->numTeeth / pinion->numTeeth;
-    gear->gearRatio = pinion->gearRatio;
-    pinion->pitchDiameter = (2 * pinion->centerDistance) / (pinion->gearRatio + 1);
-    gear->pitchDiameter = (2 * gear->centerDistance * gear->gearRatio) / (gear->gearRatio + 1);
-    pinion->baseDiameter = pinion->pitchDiameter * pinion->pressureAngle;
-    gear->baseDiameter = gear->pitchDiameter * gear->pressureAngle;
 
-    return TRUE;
+    // Print calculated parameters
+    cout << "\nCalculated Gear Parameters" << endl;
+    cout << fixed << setprecision(3);
+    cout << "Pinion:" << endl;
+    cout << "  Pitch Diameter: " << pinion->pitchDiameter << " mm" << endl;
+    cout << "  Base Diameter:  " << pinion->baseDiameter << " mm" << endl;
+    cout << "  Outside Dia:    " << pinion->outsideDiameter << " mm" << endl;
+    cout << "  Root Diameter:  " << pinion->rootDiameter << " mm" << endl;
+    cout << "  Addendum:       " << pinion->addendum << " mm" << endl;
+    cout << "  Dedendum:       " << pinion->dedendum << " mm" << endl;
+    cout << "Gear:" << endl;
+    cout << "  Pitch Diameter: " << gear->pitchDiameter << " mm" << endl;
+    cout << "  Base Diameter:  " << gear->baseDiameter << " mm" << endl;
+    cout << "  Outside Dia:    " << gear->outsideDiameter << " mm" << endl;
+    cout << "  Root Diameter:  " << gear->rootDiameter << " mm" << endl;
+    cout << "  Addendum:       " << gear->addendum << " mm" << endl;
+    cout << "  Dedendum:       " << gear->dedendum << " mm" << endl;
+    cout << "Pair:" << endl;
+    cout << "  Gear Ratio:     " << pinion->gearRatio << endl;
+    cout << "  Center Dist:    " << pinion->centerDistance << " mm" << endl;
+    cout << "----------------------------------" << endl;
+
+    cout << "Parameters loaded!" << endl;
+    return 1; // Indicate success
 }
 
-int setupProfiles(SpurGear *pinion, SpurGear *gear, DynamicsVars *dynamicvars){
-    dynamicvars->n = 100;
-    pinion->theta_e = M_PI / pinion->numTeeth;
+int setupProfiles(SpurGear* pinion, SpurGear* gear, DynamicsVars* dynamicvars) {
+    //#define f1(F_pinion_sx, F_pinion_1x, F_pinion_2x, F_pinion_3x, F_pinion_4x) (F_pinion_sx - F_pinion_1x - F_pinion_2x - F_pinion_3x - F_pinion_4x)
+    //#define f2(F_pinion_sy, F_pinion_1y, F_pinion_2y, F_pinion_3y, F_pinion_4y) (F_pinion_sy - F_pinion_1y - F_pinion_2y - F_pinion_3y - F_pinion_4y) - m_pinion * dynamicvars->g
+    //#define f3(T_pinion_1, T_pinion_2, T_pinion_3, T_pinion_4, T_d) (T_pinion_1 + T_pinion_2 + T_pinion_3 + T_pinion_4 + T_d)
+    //#define f4(F_gear_sx, F_gear_1x, F_gear_2x, F_gear_3x, F_gear_4x) (F_gear_sx - F_gear_1x - F_gear_2x - F_gear_3x - F_gear_4x)
+    //#define f5(F_gear_sy, F_gear_1y, F_gear_2y, F_gear_3y, F_gear_4y) (F_gear_sy - F_gear_1y - F_gear_2y - F_gear_3y - F_gear_4y - m_gear * dynamicvars->g)
+    //#define f6(T_gear_1, T_gear_2, T_gear_3, T_gear_4, T_l) (T_gear_1 + T_gear_2 + T_gear_3 + T_gear_4 + T_l)
+    dynamicvars->n = 100;			// number points per profile
+    pinion->theta_e = M_PI / pinion->numTeeth; // Angular pitch
     gear->theta_e = M_PI / gear->numTeeth;
-    pinion->theta_a = computeThetaA(pinion->pressureAngle);
+    pinion->theta_a = computeThetaA(pinion->pressureAngle); // Roll angle to the pitch point
     gear->theta_a = computeThetaA(gear->pressureAngle);
 
+
+    // Angle between left and right flanks on a tooth + transformations
     dynamicvars->trig_pinion = -1.0 * (pinion->theta_e + 2.0 * pinion->theta_a);
     pinion->theta_r = M_PI_2 + pinion->theta_a - pinion->theta_e / 2.;
     dynamicvars->trig_gear = -1.0 * (gear->theta_e + 2.0 * gear->theta_a);
     gear->theta_r = M_PI_2 + gear->theta_a - gear->theta_e / 2.;
-    double stepsize_pinion = ((pinion->outsideDiameter / 2.0) - (pinion->baseDiameter / 2.0)) / n;
-    double stepsize_gear = ((gear->outsideDiameter / 2.0) - (gear->baseDiameter / 2.0)) / n;
 
-    pinion->position_x_left.resize(n);
-    pinion->position_y_left.resize(n);
-    pinion->position_x_right.resize(n);
-    pinion->position_y_right.resize(n);
+    // Stepsize for generating points from base circle -> outside diameter
+    double stepsize_pinion = (pinion->outsideRadius - pinion->baseRadius) / (dynamicvars->n - 1);
+    double stepsize_gear = (gear->outsideRadius - gear->baseRadius) / (dynamicvars->n - 1);
 
-    gear->position_x_left.resize(n);
-    gear->position_y_left.resize(n);
-    gear->position_x_right.resize(n);
-    gear->position_y_right.resize(n);
+    cout << "Resizing pinion vectors to " << dynamicvars->n << endl;
+
+    pinion->position_x_left.resize(dynamicvars->n);
+    pinion->position_y_left.resize(dynamicvars->n);
+    pinion->position_x_right.resize(dynamicvars->n);
+    pinion->position_y_right.resize(dynamicvars->n);
+
+    pinion->initial_position_x_left.resize(dynamicvars->n);
+    pinion->initial_position_y_left.resize(dynamicvars->n);
+    pinion->initial_position_x_right.resize(dynamicvars->n);
+    pinion->initial_position_y_right.resize(dynamicvars->n);
+
+    cout << "  Pinion vector sizes after resize:" << endl;
+    cout << "    pos_x_l: " << pinion->position_x_left.size() << endl;
+    cout << "    init_pos_x_l: " << pinion->initial_position_x_left.size() << endl;
+
+    cout << "Resizing gear vectors to " << dynamicvars->n << endl;
+
+    gear->position_x_left.resize(dynamicvars->n);
+    gear->position_y_left.resize(dynamicvars->n);
+    gear->position_x_right.resize(dynamicvars->n);
+    gear->position_y_right.resize(dynamicvars->n);
+
+    gear->initial_position_x_left.resize(dynamicvars->n);
+    gear->initial_position_y_left.resize(dynamicvars->n);
+    gear->initial_position_x_right.resize(dynamicvars->n);
+    gear->initial_position_y_right.resize(dynamicvars->n);
+
+    cout << "  Gear vector sizes after resize:" << endl;
+    cout << "    pos_x_l: " << gear->position_x_left.size() << endl;
+    cout << "    init_pos_x_l: " << gear->initial_position_x_left.size() << endl;
 
     int i = 0;
-    //double mu_k = gear->pressureAngle + theta_k; // need to define theta_k
-    for (double r = pinion->baseDiameter / 2.0; r <= (pinion->outsideDiameter / 2); r+= stepsize_pinion) {
+    for (double r = pinion->baseDiameter / 2.0; r <= (pinion->outsideDiameter / 2); r += stepsize_pinion) {
         double mu_k = compute_mu_k_from_r(r, pinion->baseDiameter / 2);
         pinion->position_x_left[i] = (pinion->baseDiameter) / 2.0 * (sin(mu_k) - mu_k * cos(mu_k));
         pinion->position_y_left[i] = (pinion->baseDiameter) / 2.0 * (cos(mu_k) + mu_k * sin(mu_k));
@@ -180,10 +466,10 @@ int setupProfiles(SpurGear *pinion, SpurGear *gear, DynamicsVars *dynamicvars){
         i = i + 1;
     }
     i = 0;
-    for (double r = gear->baseDiameter / 2.0; r <= (gear->outsideDiameter / 2); r+= stepsize_gear) {
-        double mu_k = compute_mu_k_from_r(r, gear->baseDiameter / 2);
-        gear->position_x_left[i] = (gear->baseDiameter) / 2.0 * (sin(mu_k) - mu_k * cos(mu_k));
-        gear->position_y_left[i] = (gear->baseDiameter) / 2.0 * (cos(mu_k) + mu_k * sin(mu_k));
+    for (double r = gear->baseDiameter / 2.0; r <= (gear->outsideDiameter / 2); r += stepsize_gear) {
+        double mu_k = compute_mu_k_from_r(r, gear->baseRadius);
+        gear->position_x_left[i] = gear->baseRadius * (sin(mu_k) - mu_k * cos(mu_k));
+        gear->position_y_left[i] = gear->baseRadius * (cos(mu_k) + mu_k * sin(mu_k));
         gear->position_x_right[i] = (-1. * gear->position_x_left[i]) * cos(dynamicvars->trig_gear) + gear->position_y_left[i] * -1.0 * sin(dynamicvars->trig_gear);
         gear->position_y_right[i] = (-1. * gear->position_x_left[i]) * sin(dynamicvars->trig_gear) + gear->position_y_left[i] * -1.0 * cos(dynamicvars->trig_gear);
         i = i + 1;
@@ -191,18 +477,22 @@ int setupProfiles(SpurGear *pinion, SpurGear *gear, DynamicsVars *dynamicvars){
     return 1;
 }
 
-int dynamicsDiffEqSolver(SpurGear *pinion, SpurGear *gear, DynamicsVars *dynamicvars){
-   // Section 3
-    
 
-}
-
-int initialToothPinion(SpurGear* pinion, DynamicsVars* dynamicvars){
+void initialToothPinion(SpurGear* pinion, DynamicsVars* dynamicvars) {
     // Eq (1)
-    pinion.initialToothProfileXLeft.resize(pinion.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    pinion.initialToothProfileYLeft.resize(pinion.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    pinion.initialToothProfileXRight.resize(pinion.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    pinion.initialToothProfileYRight.resize(pinion.numTeeth, vector<double>(dynamicVars.n, 0.0));
+    if (!pinion || !dynamicvars) { cerr << "Error: Null pointer to initialToothPinion.\n"; return; }
+    int n_points_int = dynamicvars->n;
+    if (n_points_int <= 0) { cerr << "Error: Invalid n_points in initialToothPinion.\n"; return; }
+    size_t n_points = static_cast<size_t>(n_points_int);
+    if (pinion->position_x_left.size() != n_points || pinion->position_y_left.size() != n_points ||
+        pinion->position_x_right.size() != n_points || pinion->position_y_right.size() != n_points ||
+        pinion->initial_position_x_left.size() != n_points || pinion->initial_position_y_left.size() != n_points ||
+        pinion->initial_position_x_right.size() != n_points || pinion->initial_position_y_right.size() != n_points) {
+        cerr << "Error: Vector size mismatch in initialToothPinion. Expected " << n_points << endl;
+        // Print actual sizes for debugging if needed
+        // cerr << "Sizes: pos_l=" << pinion->position_x_left.size() << " init_l=" << pinion->initial_position_x_left.size() << endl;
+        return;
+    }
 
 
     for (int i = 0; i < dynamicvars->n; i++) {
@@ -211,15 +501,29 @@ int initialToothPinion(SpurGear* pinion, DynamicsVars* dynamicvars){
         pinion->initial_position_x_right[i] = cos(-1. * pinion->theta_r) * pinion->position_x_right[i] - sin(-1. * pinion->theta_r) * pinion->position_y_right[i];
         pinion->initial_position_y_right[i] = sin(-1. * pinion->theta_r) * pinion->position_x_right[i] + cos(-1. * pinion->theta_r) * pinion->position_y_right[i];
     }
+    return;
 }
 
-int initialToothGear(SpurGear* gear, DynamicsVars* dynamicvars) {
+void initialToothGear(SpurGear* gear, DynamicsVars* dynamicvars) {
     // Eq (2)
-    gear.initialToothProfileXLeft.resize(gear.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    gear.initialToothProfileYLeft.resize(gear.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    gear.initialToothProfileXRight.resize(gear.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    gear.initialToothProfileYRight.resize(gear.numTeeth, vector<double>(dynamicVars.n, 0.0));
+    /*
+    gear->initialToothProfileXLeft.resize(gear->numTeeth, vector<double>(dynamicvars->n, 0.0));
+    gear->initialToothProfileYLeft.resize(gear->numTeeth, vector<double>(dynamicvars->n, 0.0));
+    gear->initialToothProfileXRight.resize(gear->numTeeth, vector<double>(dynamicvars->n, 0.0));
+    gear->initialToothProfileYRight.resize(gear->numTeeth, vector<double>(dynamicvars->n, 0.0));
+    */
 
+    if (!gear || !dynamicvars) { cerr << "Error: Null pointer to initialToothGear.\n"; return; }
+    int n_points_int = dynamicvars->n;
+    if (n_points_int <= 0) { cerr << "Error: Invalid n_points in initialToothGear.\n"; return; }
+    size_t n_points = static_cast<size_t>(n_points_int);
+    if (gear->position_x_left.size() != n_points || gear->position_y_left.size() != n_points ||
+        gear->position_x_right.size() != n_points || gear->position_y_right.size() != n_points ||
+        gear->initial_position_x_left.size() != n_points || gear->initial_position_y_left.size() != n_points ||
+        gear->initial_position_x_right.size() != n_points || gear->initial_position_y_right.size() != n_points) {
+        cerr << "Error: Vector size mismatch in initialToothGear. Expected " << n_points << endl;
+        return;
+    }
 
     for (int i = 0; i < dynamicvars->n; i++) {
         gear->initial_position_x_left[i] = cos(gear->theta_r) * gear->position_x_left[i] - sin(gear->theta_r) * gear->position_y_left[i];
@@ -227,76 +531,59 @@ int initialToothGear(SpurGear* gear, DynamicsVars* dynamicvars) {
         gear->initial_position_x_right[i] = cos(gear->theta_r) * gear->position_x_right[i] - sin(gear->theta_r) * gear->position_y_right[i];
         gear->initial_position_y_right[i] = sin(gear->theta_r) * gear->position_x_right[i] + cos(gear->theta_r) * gear->position_y_right[i];
     }
+    return;
 }
 
-int completePinionProfile(SpurGear* pinion, DynamicsVars* dynamicvars) {
+void completePinionProfile(SpurGear* pinion, DynamicsVars* dynamicvars) {
     // Eq (5)
-   // pinion->toothProfileXLeft.resize(dynamicvars->n);
-    //pinion->toothProfileYLeft.resize(dynamicvars->n);
-    //pinion->toothProfileXRight.resize(dynamicvars->n);
-    //pinion->toothProfileYRight.resize(dynamicvars->n);
+    pinion->initialToothProfileXLeft.resize(pinion->numTeeth, vector<double>(dynamicvars->n));
+    pinion->initialToothProfileYLeft.resize(pinion->numTeeth, vector<double>(dynamicvars->n));
+    pinion->initialToothProfileXRight.resize(pinion->numTeeth, vector<double>(dynamicvars->n));
+    pinion->initialToothProfileYRight.resize(pinion->numTeeth, vector<double>(dynamicvars->n));
     for (int i = 0; i < pinion->numTeeth; i++) {
-        double z = 2 * i * pinion->theta_e;
+        double angle = 2 * i * pinion->theta_e;
         for (int j = 0; j < dynamicvars->n; j++) {
-            pinion->initialToothProfileXLeft[i][j] = cos(z) * pinion->initial_position_x_left[j] - sin(z) * pinion->initial_position_y_left[j];
-            pinion->initialToothProfileYLeft[i][j] = sin(z) * pinion->initial_position_x_left[j] + cos(z) * pinion->initial_position_y_left[j];
-            pinion->initialToothProfileXRight[i][j] = cos(z) * pinion->initial_position_x_right[j] - sin(z) * pinion->initial_position_y_right[j];
-            pinion->initialToothProfileYRight[i][j] = sin(z) * pinion->initial_position_x_right[j] + cos(z) * pinion->initial_position_y_right[j];
+            pinion->initialToothProfileXLeft[i][j] = cos(angle) * pinion->initial_position_x_left[j] - sin(angle) * pinion->initial_position_y_left[j];
+            pinion->initialToothProfileYLeft[i][j] = sin(angle) * pinion->initial_position_x_left[j] + cos(angle) * pinion->initial_position_y_left[j];
+            pinion->initialToothProfileXRight[i][j] = cos(angle) * pinion->initial_position_x_right[j] - sin(angle) * pinion->initial_position_y_right[j];
+            pinion->initialToothProfileYRight[i][j] = sin(angle) * pinion->initial_position_x_right[j] + cos(angle) * pinion->initial_position_y_right[j];
         }
     }
-    return 1;
+    return;
 }
 
-int completeGearProfile(SpurGear* gear, DynamicsVars* dynamicvars) {
+void completeGearProfile(SpurGear* gear, DynamicsVars* dynamicvars) {
     // Eq (6)
-    //gear->toothProfileXLeft.resize(dynamicvars->n);
-    //gear->toothProfileYLeft.resize(dynamicvars->n);
-    //gear->toothProfileXRight.resize(dynamicvars->n);
-    //gear->toothProfileYRight.resize(dynamicvars->n);
+    gear->initialToothProfileXLeft.resize(gear->numTeeth, vector<double>(dynamicvars->n));
+    gear->initialToothProfileYLeft.resize(gear->numTeeth, vector<double>(dynamicvars->n));
+    gear->initialToothProfileXRight.resize(gear->numTeeth, vector<double>(dynamicvars->n));
+    gear->initialToothProfileYRight.resize(gear->numTeeth, vector<double>(dynamicvars->n));
     for (int i = 0; i < gear->numTeeth; i++) {
-        double z = 2.0 * i * gear->theta_e;
+        double angle = 2.0 * i * gear->theta_e;
         for (int j = 0; j < dynamicvars->n; j++) {
-            gear->initialToothProfileXLeft[i][j] = cos(z) * gear->initial_position_x_left[j] - sin(z) * gear->initial_position_y_left[j] + gear->centerDistance;
-            gear->initialToothProfileYLeft[i][j] = sin(z) * gear->initial_position_x_left[j] + cos(z) * gear->initial_position_y_left[j];
-            gear->initialToothProfileXRight[i][j] = cos(z) * gear->initial_position_x_right[j] - sin(z) * gear->initial_position_y_right[j] + gear->centerDistance;
-            gear->initialToothProfileYRight[i][j] = sin(z) * gear->initial_position_x_right[j] + cos(z) * gear->initial_position_y_right[j];
+            gear->initialToothProfileXLeft[i][j] = cos(angle) * gear->initial_position_x_left[j] - sin(angle) * gear->initial_position_y_left[j] + gear->centerDistance;
+            gear->initialToothProfileYLeft[i][j] = sin(angle) * gear->initial_position_x_left[j] + cos(angle) * gear->initial_position_y_left[j];
+            gear->initialToothProfileXRight[i][j] = cos(angle) * gear->initial_position_x_right[j] - sin(angle) * gear->initial_position_y_right[j] + gear->centerDistance;
+            gear->initialToothProfileYRight[i][j] = sin(angle) * gear->initial_position_x_right[j] + cos(angle) * gear->initial_position_y_right[j];
         }
     }
-    return 1;
+    return;
 }
 
 double computeThetaA(double pressureAngle) {
     double pressureAngle_rad = pressureAngle * M_PI / 180.0;
-    // Compute constant C = (1 - cos(pressureAngle)) / cos(pressureAngle)
-    double C = (1.0 - cos(pressureAngle_rad)) / cos(pressureAngle_rad);
-
-    // Initial guess for theta_a (in radians). For small angles, theta^3/3 ~ C.
-    double theta = cbrt(3.0 * C);
-
-    // Newton's method iteration
-    const int maxIter = 100;
-    const double tol = 1e-6;
-    for (int i = 0; i < maxIter; i++) {
-        double f = tan(theta) - theta - C;
-        // f'(theta) = sec^2(theta) - 1 = 1/cos^2(theta) - 1
-        double fp = (1.0 / (cos(theta) * cos(theta))) - 1.0;
-        if (fabs(fp) < tol) break; // avoid division by zero
-        double theta_new = theta - f / fp;
-        if (fabs(theta_new - theta) < tol) {
-            theta = theta_new;
-            break;
-        }
-        theta = theta_new;
-    }
-    return theta;
+    if (pressureAngle <= 0 || pressureAngle >= 90) return 0;
+    double cos_pa = cos(pressureAngle_rad);
+    if (abs(cos_pa) < 1e-9) return 0; // Avoid division by zero
+    return tan(pressureAngle_rad);
 }
 
-void computeInvolutePoint(double r_base, double mu_k, double &x, double &y){
-    // Compute the coordinates on the involute given parameter u and base circle radius r_base.
-    // mu_k is the sum of theta_k and alpha_k.
-    x = r_base * (sin(mu_k) - u * cos(mu_k));
-    y = r_base * (cos(mu_k) + u * sin(mu_k));
-    return x, y;
+void computeInvolutePoint(double r_b, double mu_k, double& x, double& y) {
+    // r_b: base radius (mm)
+    // mu_k: roll angle (radians)
+    // x, y: output coordinates (mm)
+    x = r_b * (sin(mu_k) - mu_k * cos(mu_k));
+    y = r_b * (cos(mu_k) + mu_k * sin(mu_k));
 }
 
 double compute_mu_k_from_r(double r, double r_base) {
@@ -305,322 +592,528 @@ double compute_mu_k_from_r(double r, double r_base) {
     return acos(r_base / r); // since cos(mu_k) = r_base / r, so u = arccos(r_base/r)
 }
 
-State computeDerivatives(const State& state, double t, const SpurGear* pinion, const SpurGear& gear) {
-
+State computeDerivatives(const State& state, double /*t*/, SpurGear* pinion, SpurGear* gear, DynamicsVars* dynvars) {
     State dState;
+
+    // Calculate Dynamic Contact Forces/Torques
+    Vec2D Fp_contact_total, Fg_contact_total; // N
+    double Tp_contact_total, Tg_contact_total; // Nm
+    dynamicMeshingUpdate(state, pinion, gear, dynvars, Fp_contact_total, Fg_contact_total, Tp_contact_total, Tg_contact_total);
+
+    double pos_m[6], vel_m[6];
+    for (int i = 0; i < 6; ++i) { pos_m[i] = state.pos[i] / 1000.0; vel_m[i] = state.vel[i] / 1000.0; }
+    pos_m[2] = state.pos[2]; vel_m[2] = state.vel[2];
+    pos_m[5] = state.pos[5]; vel_m[5] = state.vel[5];
+
+    // Compute forces
+    double F_pinion_sx = -1.0 * (pinion->elasticCoeff * pos_m[0] + pinion->dampingCoeff * vel_m[0]); // N
+    double F_pinion_sy = -1.0 * (pinion->elasticCoeff * pos_m[1] + pinion->dampingCoeff * vel_m[1]); // N
+    double center_dist_m = pinion->centerDistance / 1000.0;
+    double gear_dx_m = pos_m[3] - center_dist_m;
+    double gear_dy_m = pos_m[4];
+    double F_gear_sx = -1.0 * (gear->elasticCoeff * gear_dx_m + gear->dampingCoeff * vel_m[3]); // N
+    double F_gear_sy = -1.0 * (gear->elasticCoeff * gear_dy_m + gear->dampingCoeff * vel_m[4]); // N
+
+    // External Torques
+    double T_d = pinion->torque; // Driving torque on pinion (Nm)
+    // Load torque on gear - needs sign convention
+    double T_l = -pinion->torque / pinion->gearRatio; // Load torque on gear (Nm) - simplified static reaction
+
+    // Gravitational force
+    double grav_force_p = pinion->mass * dynvars->g;
+    double grav_force_g = gear->mass * dynvars->g;
 
     // Derivative of positions are the velocities.
     for (int i = 0; i < 6; i++) {
         dState.pos[i] = state.vel[i];
     }
 
-    // Compute the forces and moments for the pinion and gear.
-    // These would be computed based on your model (contact forces, etc.).
-    // For example, let’s assume you have computed:
-    double F_pinion_sx, F_pinion_1x, F_pinion_2x, F_pinion_3x, F_pinion_4x;
-    double F_pinion_sy, F_pinion_1y, F_pinion_2y, F_pinion_3y, F_pinion_4y;
-    double T_pinion_1, T_pinion_2, T_pinion_3, T_pinion_4, T_d;
-    double F_gear_sx, F_gear_1x, F_gear_2x, F_gear_3x, F_gear_4x;
-    double F_gear_sy, F_gear_1y, F_gear_2y, F_gear_3y, F_gear_4y;
-    double T_gear_1, T_gear_2, T_gear_3, T_gear_4, T_l;
+    // Calculate accelerations using Newton-Euler equations (f1-f6 macros)
+    if (pinion->mass <= 0 || pinion->momentInertia <= 0 || gear->mass <= 0 || gear->momentInertia <= 0) {
+        cerr << "Error: Mass or Moment of Inertia is zero or negative in computeDerivatives." << endl;
+        for (int i = 0; i < 6; ++i) dState.vel[i] = 0;
+        return dState;
+    }
 
-    // ... (Compute these forces and moments from your contact model)
-    double F_pinion_sx  = -1.0 * (pinion->elasticCoeff * state.pos[0] + pinion->dampingCoeff * state.vel[0]);
-    double F_pinion_sy  = -1.0 * (pinion->elasticCoeff * state.pos[1] + pinion->dampingCoeff * state.vel[1]);
-    double F_gear_sx    = -1.0 * (gear->elasticCoeff * (state.pos[4] - gear->centerDistance) + gear->dampingCoeff * state.vel[4]);
-    double F_gear_sy    = -1.0 * (gear->elasticCoeff * state.pos[5] + gear->dampingCoeff * state.vel[5]);
+    // Pinion accelerations
+    dState.vel[0] = (F_pinion_sx - Fp_contact_total.x) / pinion->mass * 1000.0;
+    dState.vel[1] = (F_pinion_sy - Fp_contact_total.y - grav_force_p) / pinion->mass * 1000.0;
+    dState.vel[2] = (Tp_contact_total + T_d) / pinion->momentInertia;
 
-    // Use the macros to compute accelerations:
-    double x_double_dot_p = f1(F_pinion_sx, F_pinion_1x, F_pinion_2x, F_pinion_3x, F_pinion_4x) / pinion.mass;
-    double y_double_dot_p = f2(F_pinion_sy, F_pinion_1y, F_pinion_2y, F_pinion_3y, F_pinion_4y) / pinion.mass;
-    double phi_double_dot_p = f3(T_pinion_1, T_pinion_2, T_pinion_3, T_pinion_4, T_d) / pinion.momentInertia;
-
-    double x_double_dot_g = f4(F_gear_sx, F_gear_1x, F_gear_2x, F_gear_3x, F_gear_4x) / gear.mass;
-    double y_double_dot_g = f5(F_gear_sy, F_gear_1y, F_gear_2y, F_gear_3y, F_gear_4y) / gear.mass;
-    double phi_double_dot_g = f6(T_gear_1, T_gear_2, T_gear_3, T_gear_4, T_l) / gear.momentInertia;
-
-    // Fill in the derivative of the velocities:
-    dState.vel[0] = x_double_dot_p;
-    dState.vel[1] = y_double_dot_p;
-    dState.vel[2] = phi_double_dot_p;
-    dState.vel[3] = x_double_dot_g;
-    dState.vel[4] = y_double_dot_g;
-    dState.vel[5] = phi_double_dot_g;
-
+    // Gear accelerations
+    dState.vel[3] = (F_gear_sx - Fg_contact_total.x) / gear->mass * 1000.0;
+    dState.vel[4] = (F_gear_sy - Fg_contact_total.y - grav_force_g) / gear->mass * 1000.0;
+    dState.vel[5] = (Tg_contact_total + T_l) / gear->momentInertia;
     return dState;
-
 }
 
-State rungeKuttaStep(const State& state, double t, double dt, const SpurGear& pinion, const SpurGear& gear) {
-    State k1 = computeDerivatives(state, t, pinion, gear);
-    State state2;
+State rungeKuttaStep(const State& state, double t, double dt, SpurGear& pinion, SpurGear& gear, DynamicsVars& dynvars) {
+    State k1 = computeDerivatives(state, t, &pinion, &gear, &dynvars);
+    State state2 = state;
     for (int i = 0; i < 6; i++) {
-        state2.pos[i] = state.pos[i] + 0.5 * dt * k1.pos[i];
-        state2.vel[i] = state.vel[i] + 0.5 * dt * k1.vel[i];
+        state2.pos[i] += 0.5 * dt * k1.pos[i];
+        state2.vel[i] += 0.5 * dt * k1.vel[i];
     }
 
-    State k2 = computeDerivatives(state2, t + 0.5 * dt, pinion, gear);
-    State state3;
+    State k2 = computeDerivatives(state2, t + 0.5 * dt, &pinion, &gear, &dynvars);
+    State state3 = state;
     for (int i = 0; i < 6; i++) {
-        state3.pos[i] = state.pos[i] + 0.5 * dt * k2.pos[i];
-        state3.vel[i] = state.vel[i] + 0.5 * dt * k2.vel[i];
+        state3.pos[i] += 0.5 * dt * k2.pos[i];
+        state3.vel[i] += 0.5 * dt * k2.vel[i];
     }
 
-    State k3 = computeDerivatives(state3, t + 0.5 * dt, pinion, gear);
-    State state4;
+    State k3 = computeDerivatives(state3, t + 0.5 * dt, &pinion, &gear, &dynvars);
+    State state4 = state;
     for (int i = 0; i < 6; i++) {
-        state4.pos[i] = state.pos[i] + dt * k3.pos[i];
-        state4.vel[i] = state.vel[i] + dt * k3.vel[i];
+        state4.pos[i] += dt * k3.pos[i];
+        state4.vel[i] += dt * k3.vel[i];
     }
+    moveGearPosition(state4, &pinion, &gear, &dynvars);
+    State k4 = computeDerivatives(state4, t + dt, &pinion, &gear, &dynvars);
 
-    State k4 = computeDerivatives(state4, t + dt, pinion, gear);
-
-    State newState;
+    State newState = state;
     for (int i = 0; i < 6; i++) {
-        newState.pos[i] = state.pos[i] + (dt / 6.0) * (k1.pos[i] + 2 * k2.pos[i] + 2 * k3.pos[i] + k4.pos[i]);
-        newState.vel[i] = state.vel[i] + (dt / 6.0) * (k1.vel[i] + 2 * k2.vel[i] + 2 * k3.vel[i] + k4.vel[i]);
+        newState.pos[i] += (dt / 6.0) * (k1.pos[i] + 2.0 * k2.pos[i] + 2.0 * k3.pos[i] + k4.pos[i]);
+        newState.vel[i] += (dt / 6.0) * (k1.vel[i] + 2.0 * k2.vel[i] + 2.0 * k3.vel[i] + k4.vel[i]);
     }
     return newState;
 }
 
-void moveGearPosition(const State& state, SpurGear* pinion, SpurGear* gear, DynamicsVars* dynamicvars) {
-    pinion.currentToothProfileXLeft.resize(pinion.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    pinion.currentToothProfileYLeft.resize(pinion.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    pinion.currentToothProfileXRight.resize(pinion.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    pinion.currentToothProfileYRight.resize(pinion.numTeeth, vector<double>(dynamicVars.n, 0.0));
+void moveGearPosition(const State& state, SpurGear* pinion, SpurGear* gear, DynamicsVars* /*dynvars*/) {
+    int num_pinion_teeth = static_cast<int>(pinion->numTeeth);
+    int num_gear_teeth = static_cast<int>(gear->numTeeth);
+    size_t n_points = pinion->initialToothProfileXLeft[0].size();
+    size_t st_num_pinion = static_cast<size_t>(num_pinion_teeth);
+    n_points = static_cast<size_t>(n_points);
 
-    gear.currentToothProfileXLeft.resize(gear.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    gear.currentToothProfileYLeft.resize(gear.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    gear.currentToothProfileXRight.resize(gear.numTeeth, vector<double>(dynamicVars.n, 0.0));
-    gear.currentToothProfileYRight.resize(gear.numTeeth, vector<double>(dynamicVars.n, 0.0));
+    // Ensure current profile vectors are allocated
+    if (pinion->currentToothProfileXLeft.size() != num_pinion_teeth || pinion->currentToothProfileXLeft[0].size() != n_points) {
+        pinion->currentToothProfileXLeft.resize(num_pinion_teeth, vector<double>(n_points));
+        pinion->currentToothProfileYLeft.resize(num_pinion_teeth, vector<double>(n_points));
+        pinion->currentToothProfileXRight.resize(num_pinion_teeth, vector<double>(n_points));
+        pinion->currentToothProfileYRight.resize(num_pinion_teeth, vector<double>(n_points));
+    }
+    if (gear->currentToothProfileXLeft.size() != num_gear_teeth || gear->currentToothProfileXLeft[0].size() != n_points) {
+        gear->currentToothProfileXLeft.resize(num_gear_teeth, vector<double>(n_points));
+        gear->currentToothProfileYLeft.resize(num_gear_teeth, vector<double>(n_points));
+        gear->currentToothProfileXRight.resize(num_gear_teeth, vector<double>(n_points));
+        gear->currentToothProfileYRight.resize(num_gear_teeth, vector<double>(n_points));
+    }
 
-    for (int i = 0; i < gear->numTeeth; i++) {
-        for (int j = 0; j < dynamicvars->n; j++) {
-            pinion->currentToothProfileXLeft[i][j] = cos(dynamicvars->phi_k) * pinion->initialToothProfileXLeft[i][j] - sin(dynamicvars->phi_k) * pinion->initialToothProfileYLeft[i][j] + state.pos[0];
-            pinion->currentToothProfileYLeft[i][j] = sin(dynamicvars->phi_k) * pinion->initialToothProfileXLeft[i][j] + cos(dynamicvars->phi_k) * pinion->initialToothProfileYLeft[i][j] + state.pos[1];
-            pinion->currentToothProfileXRight[i][j] = cos(dynamicvars->phi_k) * pinion->initialToothProfileXRight[i][j] - sin(dynamicvars->phi_k) * pinion->initialToothProfileYRight[i][j] + state.pos[0];
-            pinion->currentToothProfileYRight[i][j] = sin(dynamicvars->phi_k) * pinion->initialToothProfileXRight[i][j] + cos(dynamicvars->phi_k) * pinion->initialToothProfileYRight[i][j] + state.pos[1];
+    double phi_p = state.pos[2]; // Pinion angle (rad)
+    double cos_p = cos(phi_p);
+    double sin_p = sin(phi_p);
+    double x_p = state.pos[0]; // Pinion center x (mm)
+    double y_p = state.pos[1]; // Pinion center y (mm)
 
-            gear->currentToothProfileXLeft[i][j] = cos(dynamicvars->phi_k) * (gear->initialToothProfileXLeft[i][j] - gear->centerDistance) - sin(dynamicvars->phi_k) * gear->initialToothProfileYLeft[i][j] + state.pos[3];
-            gear->currentToothProfileYLeft[i][j] = sin(dynamicvars->phi_k) * (gear->initialToothProfileYLeft[i][j] - gear->centerDistance) + cos(dynamicvars->phi_k) * gear->initialToothProfileYLeft[i][j] + state.pos[4];
-            gear->currentToothProfileXRight[i][j] = cos(dynamicvars->phi_k) * (gear->initialToothProfileXRight[i][j] - gear->centerDistance) - sin(dynamicvars->phi_k) * gear->initialToothProfileYRight[i][j] + state.pos[3];
-            gear->currentToothProfileYRight[i][j] = sin(dynamicvars->phi_k) * (gear->initialToothProfileYRight[i][j] - gear->centerDistance) + cos(dynamicvars->phi_k) * gear->initialToothProfileYRight[i][j] + state.pos[4];
+    double phi_g = state.pos[5]; // Gear angle (rad)
+    double cos_g = cos(phi_g);
+    double sin_g = sin(phi_g);
+    double x_g = state.pos[3]; // Gear center x (mm)
+    double y_g = state.pos[4]; // Gear center y (mm)
+    double nominal_center_dist = pinion->centerDistance; // Assuming this is nominal
+
+    // Update Pinion Profiles
+    for (int i = 0; i < num_pinion_teeth; ++i) {
+        for (int j = 0; j < n_points; ++j) {
+            double x0_l = pinion->initialToothProfileXLeft[i][j];
+            double y0_l = pinion->initialToothProfileYLeft[i][j];
+            pinion->currentToothProfileXLeft[i][j] = x0_l * cos_p - y0_l * sin_p + x_p;
+            pinion->currentToothProfileYLeft[i][j] = x0_l * sin_p + y0_l * cos_p + y_p;
+
+            double x0_r = pinion->initialToothProfileXRight[i][j];
+            double y0_r = pinion->initialToothProfileYRight[i][j];
+            pinion->currentToothProfileXRight[i][j] = x0_r * cos_p - y0_r * sin_p + x_p;
+            pinion->currentToothProfileYRight[i][j] = x0_r * sin_p + y0_r * cos_p + y_p;
+        }
+    }
+    // Update Gear Profiles (Rotate around nominal center, then translate along x-axis)
+    for (int i = 0; i < num_gear_teeth; ++i) {
+        for (int j = 0; j < n_points; ++j) {
+            // Point relative to gear's nominal center (nominal_center_dist, 0)
+            double x0_l_rel = gear->initialToothProfileXLeft[i][j] - nominal_center_dist;
+            double y0_l_rel = gear->initialToothProfileYLeft[i][j];
+            // Rotate around nominal center
+            double x_rot_l = x0_l_rel * cos_g - y0_l_rel * sin_g;
+            double y_rot_l = x0_l_rel * sin_g + y0_l_rel * cos_g;
+            // Translate to current gear center (x_g, y_g)
+            gear->currentToothProfileXLeft[i][j] = x_rot_l + x_g;
+            gear->currentToothProfileYLeft[i][j] = y_rot_l + y_g;
+
+            double x0_r_rel = gear->initialToothProfileXRight[i][j] - nominal_center_dist;
+            double y0_r_rel = gear->initialToothProfileYRight[i][j];
+            double x_rot_r = x0_r_rel * cos_g - y0_r_rel * sin_g;
+            double y_rot_r = x0_r_rel * sin_g + y0_r_rel * cos_g;
+            gear->currentToothProfileXRight[i][j] = x_rot_r + x_g;
+            gear->currentToothProfileYRight[i][j] = y_rot_r + y_g;
         }
     }
 }
+void dynamicMeshingUpdate(const State& state, SpurGear* pinion, SpurGear* gear, DynamicsVars* dynvars, Vec2D& total_pinion_force, Vec2D& total_gear_force, double& total_pinion_torque, double& total_gear_torque) {
 
-void meshingLine(SpurGear* pinion, SpurGear* gear, DynamicsVars* dynamicvars) {
-    double xcenterpinion = 0;
-    double ycenterpinion = 0;
-
-    double xcentergear = gear->centerDistance;
-    double ycentergear = 0;
-
-    // Theta_pk is the angle between the line connecting the gear and pinion's rotating axis and the x-axis.
-    double theta_pk = atan2(ycentergear - ycenterpinion, xcentergear - xcenterpinion);
-    
-    double transmissionratio = pinion->gearRatio;
-    double a_k_Pinion = sqrt(pow(xcentergear - xcenterpinion, 2) + pow(ycentergear - ycenterpinion, 2));
-    double pitchCircleRadiusPinion = a_k_Pinion / (1 + transmissionratio);
-
-    // Eq (16)
-    double pitchPointX, pitchPointY;
-    if (ycentergear >= 0) {
-        pitchPointX = pitchCircleRadiusPinion * cos(theta_pk) + xcenterpinion;
-        pitchPointY = pitchCircleRadiusPinion * sin(theta_pk) + ycenterpinion;
+    total_pinion_force = Vec2D(0, 0);
+    total_gear_force = Vec2D(0, 0);
+    total_pinion_torque = 0;
+    total_gear_torque = 0;
+    pinion->activeContactPairs.clear();
+    Vec2D O1(state.pos[0] / 1000.0, state.pos[1] / 1000.0);
+    Vec2D O2(state.pos[3] / 1000.0, state.pos[4] / 1000.0);
+    double phi1 = state.pos[2];
+    double phi2 = state.pos[5];
+    double omega1 = state.vel[2];
+    double omega2 = state.vel[5];
+    Vec2D V1(state.vel[0] / 1000.0, state.vel[1] / 1000.0); Vec2D V2(state.vel[3] / 1000.0, state.vel[4] / 1000.0);
+    double pressureAngle_rad = pinion->pressureAngle * M_PI / 180.0;
+    int num_pinion_teeth = static_cast<int>(pinion->numTeeth);
+    int num_gear_teeth = static_cast<int>(gear->numTeeth);
+    size_t n_points = static_cast<size_t>(dynvars->n);
+    if (n_points == 0 || num_pinion_teeth <= 0 || num_gear_teeth <= 0) { return; }
+    if (pinion->currentToothProfileXLeft.size() != static_cast<size_t>(num_pinion_teeth) || pinion->currentToothProfileXLeft[0].size() != n_points ||
+        gear->currentToothProfileXLeft.size() != static_cast<size_t>(num_gear_teeth) || gear->currentToothProfileXLeft[0].size() != n_points) {
+        return;
     }
-    else {
-        pitchPointX = pitchCircleRadiusPinion * cos(theta_pk) + xcenterpinion;
-        pitchPointY = -1.0 * pitchCircleRadiusPinion * sin(theta_pk) + ycenterpinion;
-    }
-    double k1 = computeInvoluteSlope((pinion->baseDiameter / 2.0), (pinion->pitchDiameter / 2.0));
-    double k2 = computeInvoluteSlope((gear->baseDiameter / 2.0), (gear->pitchDiameter / 2.0));
 
-    // Line of mesh point - Eq (17) and Eq (18)
-    // y = k1 * (x - pitchPointX) + pitchPointY;
-    // y = k2 * (x - pitchPointX) + pitchPointY;
+    double Ze = calculateZe(pinion, gear);
+    double ZI = calculateZI(pinion, gear); // Using static version
+    double F_mm = min(pinion->faceWidth, gear->faceWidth);
+    double F_in = F_mm / 25.4;
+    int Qv = pinion->Qv;
+    int gearQuality = pinion->gearQuality;
+    double Ko = pinion->Ko;
+    double Ks = pinion->Ks;
+    double ZR = pinion->ZR;
+    double KH = calculateKH(pinion, gear, F_in, gearQuality);
 
-    double u_mesh1 = solveForU((pinion->baseDiameter / 2.0), k1, pitchPointX, pitchPointY, 0.1);
-    double x_mesh1, y_mesh1;
-    computeInvolutePoint((pinion->baseDiameter / 2.0), u_mesh1, x_mesh1, y_mesh1);
+    double pinion_angle_tooth0 = pinion->theta_r;
+    double gear_angle_tooth0 = gear->theta_r;
+    double center_line_angle = atan2(O2.y - O1.y, O2.x - O1.x);
+    double target_angle_p = center_line_angle - pressureAngle_rad;
+    double target_angle_g = center_line_angle + pressureAngle_rad - M_PI;
+    target_angle_p = fmod(target_angle_p, 2.0 * M_PI);
+    if (target_angle_p < 0) target_angle_p += 2.0 * M_PI;
+    target_angle_g = fmod(target_angle_g, 2.0 * M_PI);
+    if (target_angle_g < 0) target_angle_g += 2.0 * M_PI;
+    double current_tooth0_angle_p = fmod(phi1 + pinion_angle_tooth0, 2.0 * M_PI);
+    if (current_tooth0_angle_p < 0) current_tooth0_angle_p += 2.0 * M_PI;
+    double current_tooth0_angle_g = fmod(phi2 + gear_angle_tooth0, 2.0 * M_PI);
+    if (current_tooth0_angle_g < 0) current_tooth0_angle_g += 2.0 * M_PI;
+    double angle_diff_p = target_angle_p - current_tooth0_angle_p;
+    double angle_diff_g = target_angle_g - current_tooth0_angle_g;
+    angle_diff_p = fmod(angle_diff_p, 2.0 * M_PI);
+    if (angle_diff_p < 0) angle_diff_p += 2.0 * M_PI;
+    angle_diff_g = fmod(angle_diff_g, 2.0 * M_PI);
+    if (angle_diff_g < 0) angle_diff_g += 2.0 * M_PI;
+    int p_idx_center = static_cast<int>(round(angle_diff_p / (2.0 * pinion->theta_e))) % num_pinion_teeth;
+    int g_idx_center = static_cast<int>(round(angle_diff_g / (2.0 * gear->theta_e))) % num_gear_teeth;
+    if (p_idx_center < 0) p_idx_center += num_pinion_teeth;
+    if (g_idx_center < 0) g_idx_center += num_gear_teeth;
 
-    double u_mesh2 = solveForU((pinion->baseDiameter / 2.0), k1, pitchPointX, pitchPointY, 0.1);
-    double x_mesh2, y_mesh2;
-    computeInvolutePoint((pinion->baseDiameter / 2.0), u_mesh2, x_mesh2, y_mesh2);
+    bool contact_found_this_step = false; // Flag for debug print
 
-    cout << "Mesh point coordinates: (" << x_mesh << ", " << y_mesh << ")" << endl;
+    for (int p_offset = -1; p_offset <= 1; ++p_offset) {
+        int p_idx = (p_idx_center + p_offset + num_pinion_teeth) % num_pinion_teeth;
+        for (int g_offset = -1; g_offset <= 1; ++g_offset) {
+            int g_idx = (g_idx_center + g_offset + num_gear_teeth) % num_gear_teeth;
+            for (size_t j = 0; j < n_points; ++j) {
+                Vec2D p1(pinion->currentToothProfileXLeft[p_idx][j] / 1000.0, pinion->currentToothProfileYLeft[p_idx][j] / 1000.0);
+                Vec2D p2(gear->currentToothProfileXLeft[g_idx][j] / 1000.0, gear->currentToothProfileYLeft[g_idx][j] / 1000.0);
+                Vec2D diff = p1 - p2;
+                double dist = mag(diff);
+                double dist_sq = dot(diff, diff);
 
-    // Calculate distance between two candidate mesh points.
-    double delta = sqrt(pow(x_mesh1 - x_mesh2, 2) + pow(y_mesh1 - y_mesh2, 2));
-    if (delta <= dynamicvars->deltaJudgmentThreshold) {
-        ContactPoint cp;
-        cp.x = x_mesh1;
-        cp.y = y_mesh1;
-        pinion->contactPoints.push_back(cp);
-        gear->contactPoints.push_back(cp);
-        cout << "Single meshing point detected: (" << cp.x << ", " << cp.y << ")" << endl;
-    }
-    else {
-        // The candidate points are distinct -> there is two separate contact pairs
-        ContactPoint cp1, cp2;
-        cp1.x = x_mesh1;
-        cp1.y = y_mesh1;
-        cp2.x = x_mesh2;
-        cp2.y = y_mesh2;
-        pinion->contactPoints.push_back(cp1);
-        pinion->contactPoints.push_back(cp2);
-        gear->contactPoints.push_back(cp1);
-        gear->contactPoints.push_back(cp2);
-        cout << "Two distinct meshing points detected:" << endl;
-        cout << "Point 1: (" << cp1.x << ", " << cp1.y << ")" << endl;
-        cout << "Point 2: (" << cp2.x << ", " << cp2.y << ")" << endl;
-    }
+                // Debug - Distance Check
+                // Print only if points are kinda close
+                bool print_debug = (dynvars->stepCounter < 50); // Limit debug prints
+                if (print_debug && dist < CONTACT_THRESHOLD_SI * 20.0) { // Check if within 20x threshold
+                    cout << fixed << setprecision(9);
+                    cout << "  DEBUG Step " << dynvars->stepCounter << ": P" << p_idx << "[" << j << "] G" << g_idx << "[" << j << "] Dist=" << dist * 1e6 << "um";
+                }
+
+                if (dist_sq < pow(CONTACT_THRESHOLD_SI * 2.0, 2)) {
+                    double normal_angle = center_line_angle - pressureAngle_rad;
+                    Vec2D n_g = Vec2D(cos(normal_angle), sin(normal_angle));
+                    double penetration = dot(diff, n_g);
+
+                    if (print_debug) { // Print if close enough
+                        cout << " | Pen=" << penetration * 1e6 << "um";
+                    }
+                    if (penetration > PENETRATION_THRESHOLD_SI) {
+                        contact_found_this_step = true; // Mark contact found
+
+                        // Debug - Contact detected
+                        if (print_debug) {
+                            cout << " | CONTACT DETECTED " << endl;
+                        }
+
+                        double delta = penetration;
+                        Vec2D r1 = p1 - O1;
+                        Vec2D r2 = p2 - O2;
+                        Vec2D v1 = V1 + Vec2D(-omega1 * r1.y, omega1 * r1.x);
+                        Vec2D v2 = V2 + Vec2D(-omega2 * r2.y, omega2 * r2.x);
+                        Vec2D v_rel = v1 - v2;
+                        double delta_dot = dot(v_rel, n_g);
+                        Vec2D v_t = v_rel - n_g * delta_dot;
+                        double vt_mag = mag(v_t);
+                        double kv = getMeshStiffness(pinion, gear, p1);
+                        double cd = dynvars->meshDampingCoeff;
+                        double mu = dynvars->frictionCoeff;
+                        double fF = computeFrictionParameter(vt_mag, dynvars->v0_friction, dynvars->vL_friction);
+                        Vec2D F_contact = computeContactForce(delta, delta_dot, kv, cd, mu, fF, v_t, n_g);
+
+                        // having issue with stress values being all zeros. printing statements to the terminal to debug issue.
+                        if (dynvars->stepCounter < 100) {
+                            cout << "Debug - contact detected at step " << dynvars->stepCounter << " between P" << p_idx << "/G" << g_idx << " point " << j << " (Penetration: " << delta * 1e6 << " um" << endl;
+                        }
+                        // Accumulate forces/torques
+                        total_pinion_force = total_pinion_force + F_contact;
+                        total_gear_force = total_gear_force - F_contact;
+                        total_pinion_torque += computeMoment(p1, O1, F_contact);
+                        total_gear_torque += computeMoment(p2, O2, -F_contact);
+                        pinion->activeContactPairs.push_back({ p1, p2 });
+
+                        // Calculate Dynamic Stress & Update Peak Profile
+                        double Fn_mag = dot(F_contact, n_g); // Normal component of total contact force
+                        if (Fn_mag > 0) { // Only calculate stress if there's positive normal force
+                            // Approximate Wt from Normal Force
+                            double Wt_dyn = Fn_mag / cos(pressureAngle_rad); // N
+
+                            // Dynamic Velocity for Kv (use instantaneous pitch line velocity)
+                            double V_dyn_mps = abs(omega1 * (pinion->pitchRadius / 1000.0)); // m/s
+                            double V_dyn_fpm = V_dyn_mps * 196.850; // ft/min
+                            double Kv_dyn = calculateKv(V_dyn_fpm, Qv);
+
+                            // Calculate instantaneous stress using dynamic Wt, Kv and static factors
+                            double sigma_c_inst = calcContactStress(pinion, gear, Wt_dyn, V_dyn_mps, Ko, Qv, gearQuality, Ks, ZR);
+
+                            if (dynvars->stepCounter < 100) {
+                                cout << "  Debug - Wt_dyn=" << Wt_dyn << " V_dyn=" << V_dyn_mps << " Kv_dyn=" << Kv_dyn << " -> sigma_c_inst=" << sigma_c_inst << endl;
+                            }
+
+                            if (sigma_c_inst >= 0) { // Check for valid stress calculation
+                                // Transform p1 (global, m) to local initial frame (mm)
+                                Vec2D p1_rel_center_m = p1 - O1;
+                                // Rotate back by current angle phi1
+                                Vec2D p1_local_rotated_m = rotate(p1_rel_center_m, -phi1);
+                                Vec2D p1_local_initial_mm = p1_local_rotated_m * 1000.0;
+                                size_t closest_j = findClosestProfileIndex(p1_local_initial_mm, pinion);
+                                if (closest_j < pinion->contactStressProfile.size()) {
+                                    pinion->contactStressProfile[closest_j] = max(pinion->contactStressProfile[closest_j], sigma_c_inst);
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        // Debug - Close but No Penetration
+                        if (print_debug) {
+                            cout << " | No Penetration" << endl;
+                        }
+                    }
+                }
+                else {
+                    // Debug - Too Far
+                    if (print_debug && dist < CONTACT_THRESHOLD_SI * 20.0) { // Only print if kinda close
+                        cout << " | Too Far" << endl;
+                    }
+                }
+            } // end loop j
+        } // end loop g_offset
+    }// end loop p_offset
+   // Increment step counter (moved outside loops)
+    dynvars->stepCounter++;
 }
 
-// Helper functions for meshingLine();
+/*
+void dynamicMeshingUpdate(const State& state, SpurGear* pinion, SpurGear* gear, DynamicsVars* dynvars, Vec2D& total_pinion_force, Vec2D& total_gear_force, double& total_pinion_torque, double& total_gear_torque) {
+    // Reset totals
+    total_pinion_force = Vec2D(0, 0);
+    total_gear_force = Vec2D(0, 0);
+    total_pinion_torque = 0;
+    total_gear_torque = 0;
+    pinion->activeContactPairs.clear(); // Clear previous points
 
-double computeInvoluteSlope(double baseRadius, double pitchRadius) {
-    // Ensure pitchRadius is greater than baseRadius to avoid invalid input.
-    if (pitchRadius <= baseRadius) {
-        cout << "Error: pitchRadius must be greater than baseRadius." << endl;
-        return 0.0;
+    // Current centers (m)
+    Vec2D O1(state.pos[0] / 1000.0, state.pos[1] / 1000.0);
+    Vec2D O2(state.pos[3] / 1000.0, state.pos[4] / 1000.0);
+
+    // Current angular positions (rad) and velocities (rad/s)
+    double phi1 = state.pos[2];
+    double phi2 = state.pos[5];
+    double omega1 = state.vel[2];
+    double omega2 = state.vel[5];
+
+    // Center velocities (m/s)
+    Vec2D V1(state.vel[0] / 1000.0, state.vel[1] / 1000.0);
+    Vec2D V2(state.vel[3] / 1000.0, state.vel[4] / 1000.0);
+
+    // Gear parameters in SI (m)
+    double pressureAngle_rad = pinion->pressureAngle * M_PI / 180.0; // Assuming same
+
+    // 1. Identify potentially meshing teeth pairs
+    int num_pinion_teeth = static_cast<int>(pinion->numTeeth);
+    int num_gear_teeth = static_cast<int>(gear->numTeeth);
+    int n_points = dynvars->n; // Points per profile flank
+
+    if (n_points <= 0 || num_pinion_teeth <= 0 || num_gear_teeth <= 0) { return; }
+    if (pinion->currentToothProfileXLeft.size() != static_cast<size_t>(num_pinion_teeth) ||
+        pinion->currentToothProfileXLeft[0].size() != static_cast<size_t>(n_points) ||
+        gear->currentToothProfileXLeft.size() != static_cast<size_t>(num_gear_teeth) ||
+        gear->currentToothProfileXLeft[0].size() != static_cast<size_t>(n_points)) {
+        return; // Vectors not sized correctly
     }
-    double u = acos(baseRadius / pitchRadius);
-    // Compute slope: k = cot(u) = cos(u) / sin(u)
-    double sin_u = sin(u);
-    if (fabs(sin_u) < 1e-8) { // Avoid division by zero
-        cout << "Error: sin(acos(baseRadius / pitchRadius)) is < 1e-8" << endl;
-        return 0.0;
-    }
-    return (cos(u) / sin_u);
-}
 
-void computeInvolutePoint(double r_b, double u, double& x, double& y) {
-    x = r_b * (sin(u) - u * cos(u));
-    y = r_b * (cos(u) + u * sin(u));
-}
+    double pinion_angle_tooth0 = pinion->theta_r;
+    double gear_angle_tooth0 = gear->theta_r;
+    double center_line_angle = atan2(O2.y - O1.y, O2.x - O1.x);
+    double target_angle_p = center_line_angle - pressureAngle_rad;
+    double target_angle_g = center_line_angle + pressureAngle_rad - M_PI;
+    target_angle_p = fmod(target_angle_p, 2.0 * M_PI); if (target_angle_p < 0) target_angle_p += 2.0 * M_PI;
+    target_angle_g = fmod(target_angle_g, 2.0 * M_PI); if (target_angle_g < 0) target_angle_g += 2.0 * M_PI;
+    double current_tooth0_angle_p = fmod(phi1 + pinion_angle_tooth0, 2.0 * M_PI); if (current_tooth0_angle_p < 0) current_tooth0_angle_p += 2.0 * M_PI;
+    double current_tooth0_angle_g = fmod(phi2 + gear_angle_tooth0, 2.0 * M_PI); if (current_tooth0_angle_g < 0) current_tooth0_angle_g += 2.0 * M_PI;
+    double angle_diff_p = target_angle_p - current_tooth0_angle_p;
+    double angle_diff_g = target_angle_g - current_tooth0_angle_g;
+    angle_diff_p = fmod(angle_diff_p, 2.0 * M_PI); if (angle_diff_p < 0) angle_diff_p += 2.0 * M_PI;
+    angle_diff_g = fmod(angle_diff_g, 2.0 * M_PI); if (angle_diff_g < 0) angle_diff_g += 2.0 * M_PI;
 
-double F(double u, double r_b, double k, double x_J, double y_J) {
-    double x_u, y_u;
-    computeInvolutePoint(r_b, u, x_u, y_u);
-    return y_u - (k * (x_u - x_J) + y_J);
-}
+    int p_idx_center = static_cast<int>(round(angle_diff_p / (2.0 * pinion->theta_e))) % num_pinion_teeth;
+    int g_idx_center = static_cast<int>(round(angle_diff_g / (2.0 * gear->theta_e))) % num_gear_teeth;
+    if (p_idx_center < 0) p_idx_center += num_pinion_teeth;
+    if (g_idx_center < 0) g_idx_center += num_gear_teeth;
 
-double dFdu(double u, double r_b, double k, double x_J, double y_J, double h = 1e-6) {
-    // numerical derivative for F(u)
-    return (F(u + h, r_b, k, x_J, y_J) - F(u - h, r_b, k, x_J, y_J)) / (2 * h);
-}
+    // Check tooth pairs around these central indices (+/- 1 or 2)
+    for (int p_offset = -1; p_offset <= 1; ++p_offset) {
+        int p_idx = (p_idx_center + p_offset + num_pinion_teeth) % num_pinion_teeth;
+        for (int g_offset = -1; g_offset <= 1; ++g_offset) {
+            int g_idx = (g_idx_center + g_offset + num_gear_teeth) % num_gear_teeth;
 
-double solveForU(double r_b, double k, double x_J, double y_J, double initialGuess = 0.1, int maxIter = 100, double tol = 1e-6) {
-    // Newton's method to solve F(u) = 0
-    double u = initialGuess;
-    for (int i = 0; i < maxIter; i++) {
-        double fVal = F(u, r_b, k, x_J, y_J);
-        double fDeriv = dFdu(u, r_b, k, x_J, y_J);
-        if (fabs(fDeriv) < tol) {  // Avoid division by near-zero.
-            cout << "Derivative too small in Newton's method." << endl;
-            break;
+            // Check for contact between points on these teeth (Driving: Pinion Left vs Gear Left)
+            for (int j = 0; j < n_points; ++j) {
+                Vec2D p1(pinion->currentToothProfileXLeft[p_idx][j] / 1000.0, pinion->currentToothProfileYLeft[p_idx][j] / 1000.0); // m
+                Vec2D p2(gear->currentToothProfileXLeft[g_idx][j] / 1000.0, gear->currentToothProfileYLeft[g_idx][j] / 1000.0); // m
+                Vec2D diff = p1 - p2;
+                double dist_sq = dot(diff, diff);
+
+                if (dist_sq < pow(CONTACT_THRESHOLD_SI * 2.0, 2)) {
+                    double normal_angle = center_line_angle - pressureAngle_rad;
+                    Vec2D n_g = Vec2D(cos(normal_angle), sin(normal_angle));
+                    double penetration = dot(diff, n_g);
+
+                    if (penetration > PENETRATION_THRESHOLD_SI) {
+                        double delta = penetration;
+                        Vec2D r1 = p1 - O1;
+                        Vec2D r2 = p2 - O2;
+                        Vec2D v1 = V1 + Vec2D(-omega1 * r1.y, omega1 * r1.x);
+                        Vec2D v2 = V2 + Vec2D(-omega2 * r2.y, omega2 * r2.x);
+                        Vec2D v_rel = v1 - v2;
+                        double delta_dot = dot(v_rel, n_g);
+                        Vec2D v_t = v_rel - n_g * delta_dot;
+                        double vt_mag = mag(v_t);
+                        double kv = getMeshStiffness(pinion, gear, p1);
+                        double cd = dynvars->meshDampingCoeff; // Use SI value from dynvars
+                        double mu = dynvars->frictionCoeff;
+                        double fF = computeFrictionParameter(vt_mag, dynvars->v0_friction, dynvars->vL_friction);
+                        Vec2D F_contact = computeContactForce(delta, delta_dot, kv, cd, mu, fF, v_t, n_g); // N
+
+                        total_pinion_force = total_pinion_force + F_contact;
+                        total_gear_force = total_gear_force - F_contact;
+                        total_pinion_torque += computeMoment(p1, O1, F_contact);
+                        total_gear_torque += computeMoment(p2, O2, -F_contact);
+                        pinion->activeContactPairs.push_back({ p1, p2 });
+                    }
+                }
+            }
+            // TODO: Add check for backlash contact (Pinion Right vs Gear Right)
         }
-        double u_next = u - fVal / fDeriv;
-        if (fabs(u_next - u) < tol)
-            return u_next;
-        u = u_next;
     }
-    return u;
 }
+*/
 
-// End of helper functions
-
-void computeContactVectors(const Vec2& p1, const Vec2& p2, const SpurGear& gear, Vec2& n_g, Vec2& n1, Vec2& n1_t, Vec2& n2, Vec2& n2_t) {
+void computeContactVectors(const Vec2D& p1, const Vec2D& p2, const Vec2D& O1, const Vec2D& O2, Vec2D& n_g, Vec2D& n1, Vec2D& n1_t, Vec2D& n2, Vec2D& n2_t) {
     // p1: contact point on pinion, p2: contact point on gear
     // Eq (20): unit normal vector in the deformation direction.
-    n_g = computeUnitVector(p1, p2);
+    n_g = normalize(p1 - p2); // Vector from p2 to p1, normalized
 
-    // Eq (21): unit vector from pinion center (0,0) to contact point p1.
-    Vec2 O1 = { 0.0, 0.0 };
-    n1 = computeUnitVector(p1, O1);
+    // Eq (21): unit vector from pinion center O1 to contact point p1.
+    n1 = normalize(p1 - O1);
 
-    // Eq (22): unit vector from gear center (centerDistance, 0) to contact point p2.
-    Vec2 O2 = { gear.centerDistance, 0.0 };
-    n2 = computeUnitVector(p2, O2);
+    // Eq (22): unit vector from gear center O2 to contact point p2.
+    n2 = normalize(p2 - O2);
 
-    // Eq (23) and Eq (24): rotate the above unit vectors by 90 degrees.
+    // Eq (23) & (24): Tangential vectors (rotate 90 deg CCW assuming standard axes)
     n1_t = rotate90(n1);
     n2_t = rotate90(n2);
-
-    // debugging output
-    cout << "Deformation unit vector n_g = (" << n_g.x << ", " << n_g.y << ")\n";
-    cout << "Pinion unit vector n1 = (" << n1.x << ", " << n1.y << ")\n";
-    cout << "Pinion tangential unit vector n1_t = (" << n1_t.x << ", " << n1_t.y << ")\n";
-    cout << "Gear unit vector n2 = (" << n2.x << ", " << n2.y << ")\n";
-    cout << "Gear tangential unit vector n2_t = (" << n2_t.x << ", " << n2_t.y << ")\n";
 }
 
-// Helper functions for computerContactVectors()
+// Helper functions for computeContactVectors()
 
-Vec2D computeUnitVector(const Vec2& p1, const Vec2& p2) {
-    Vec2 diff;
+Vec2D computeUnitVector(const Vec2D& p1, const Vec2D& p2) {
+    Vec2D diff;
     diff.x = p1.x - p2.x;
     diff.y = p1.y - p2.y;
     double norm = sqrt(diff.x * diff.x + diff.y * diff.y);
     return { diff.x / norm, diff.y / norm };
 }
 
-Vec2D rotate90(const Vec2& v) {
-    // Rotation 90° CCW
-    return { -v.y, v.x };
-}
-
 // End of helper functions
 
-Vec2D computeContactForce(double delta, double delta_dot, double kv, double cd, double mu, double fF, const Vec2D& v_t, const Vec2D& n, const Vec2D& n_t) {
-    // Computes the net contact force at a mesh point
-    // Inputs:
-    //   delta    : deformation
-    //   delta_dot: time derivative of deformation
-    //   kv       : meshing stiffness
-    //   cd       : damping coefficient
-    //   mu       : friction coefficient
-    //   fF       : friction parameter
-    //   v_t      : relative tangential velocity vector
-    //   n        : unit normal (deformation) vector
-    //   n_t      : unit tangential vector
-    // Returns:
-    //   A 2D vector representing the net contact force
-    
-    double v0 = 0.1; // m/s, below which friction is not fully activated
-    double vL = 0.5; // m/s, above which full sliding friction is assumed
-
-    // Compute the normal contact force
-    double F_cg = kv * delta + cd * delta_dot;
-
-    // Compute the friction force
-    Vec2D F_friction = { 0.0, 0.0 };
-    double vt_mag = sqrt(v_t.x * v_t.x + v_t.y * v_t.y);
-    double fF = computeFrictionParameter(vt_mag, v0, vL);
-    if (vt_mag > 1e-6) { // Avoid divide by zero.
-        // Friction force 
-        F_friction.x = -fF * mu * F_cg * (v_t.x / vt_mag);
-        F_friction.y = -fF * mu * F_cg * (v_t.y / vt_mag);
+size_t findClosestProfileIndex(const Vec2D& contact_point_local_mm, const SpurGear* gear) {
+    if (!gear || gear->initial_position_x_left.empty()) {
+        return 0; // Return 0 if error or empty profile
     }
-    // Compute the net contact force
-    Vec2D F;
-    F.x = F_cg * n.x + F_friction.x * n_t.x;
-    F.y = F_cg * n.y + F_friction.y * n_t.y;
-    return F;
+
+    size_t n_points = gear->initial_position_x_left.size();
+    size_t closest_j = 0;
+    double min_dist_sq = numeric_limits<double>::max();
+
+    for (size_t j = 0; j < n_points; ++j) {
+        // Get point j from the initial profile (left flank)
+        Vec2D profile_point_j(gear->initial_position_x_left[j], gear->initial_position_y_left[j]);
+        // Calculate squared distance
+        Vec2D diff = contact_point_local_mm - profile_point_j;
+        double dist_sq = dot(diff, diff);
+
+        if (dist_sq < min_dist_sq) {
+            min_dist_sq = dist_sq;
+            closest_j = j;
+        }
+    }
+    return closest_j;
 }
 
-Vec2D normalize(const Vector2D& v) {
-    double norm = sqrt(v.x * v.x + v.y * v.y);
-    if (norm < 1e-8) {
-        cout << "Error: norm too small in normalization." << endl;
-        return { 0.0, 0.0 };
+Vec2D computeContactForce(double delta, double delta_dot, double kv, double cd, double mu, double fF,
+    const Vec2D& v_t, const Vec2D& n_g) {
+    // Inputs:
+    // delta:     Deformation (penetration) (m)
+    // delta_dot: Normal relative velocity (m/s)
+    // kv:        Mesh stiffness (N/m)
+    // cd:        Mesh damping coefficient (Ns/m)
+    // mu:        Coefficient of friction
+    // fF:        Friction parameter (from computeFrictionParameter)
+    // v_t:       Tangential relative velocity vector (m/s)
+    // n_g:       Unit normal vector
+    // t_hat:     Unit tangential vector
+    // Returns:   Force vector ON PINION (N)
+
+    // Normal Force Calculation
+    double Fn_mag = kv * delta + cd * delta_dot;
+    // Ensure contact force is not adhesive (cannot pull)
+    if (Fn_mag < 0) {
+        Fn_mag = 0;
     }
-    return { v.x / norm, v.y / norm };
+    Vec2D Fn_vec = n_g * Fn_mag; // Normal force ON PINION (along n_g)
+
+    // Friction Force Calculation
+    // Friction opposes relative tangential motion (v_t)
+    Vec2D t_hat = normalize(v_t);
+    Vec2D Ff_vec = t_hat * (-fF * mu * Fn_mag); // Friction force ON PINION
+
+    // Total Force ON PINION
+    return Fn_vec + Ff_vec; // N
 }
 
 double computeFrictionParameter(double vtMagnitude, double v0, double vL) {
     // Eq (34)
+    vtMagnitude = abs(vtMagnitude);
     if (vtMagnitude <= v0)
         return 0.0;
     else if (vtMagnitude <= vL)
@@ -629,7 +1122,20 @@ double computeFrictionParameter(double vtMagnitude, double v0, double vL) {
         return 1.0;
 }
 
-double computeMoment(const double contactX, const double contactY, const double centerX, const double centerY, const double forceX, const double forceY) {
-    // Eq (36) and Eq (37)
-    return (contactY - centerY) * forceX - (contactX - centerX) * forceY;
+double getMeshStiffness(const SpurGear* pinion, const SpurGear* gear, const Vec2D& contact_point_pinion) {
+    // TODO: Implement Time-Varying Mesh Stiffness calculation based on contact point position
+    // For now, return a constant average value in SI units
+    return MESH_STIFFNESS_SI;
 }
+
+double getMeshDampingCoeff(double kv, double zeta, double m_pinion, double m_gear) {
+    double m_eff = 1.0 / (1.0 / m_pinion + 1.0 / m_gear);
+    return 2.0 * zeta * sqrt(m_eff * kv); // Units: Ns/m if kv is N/m, m_eff is kg
+}
+
+double computeMoment(const Vec2D& contactPoint, const Vec2D& centerPoint, const Vec2D& forceVector) {
+    Vec2D r = contactPoint - centerPoint; // Lever arm vector
+    return r.x * forceVector.y - r.y * forceVector.x; // Units: m * N = Nm
+}
+
+

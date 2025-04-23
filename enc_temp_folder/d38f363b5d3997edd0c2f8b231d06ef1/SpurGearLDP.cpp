@@ -311,6 +311,31 @@ int main() {
 }
 */
 
+void outputGearProfile(const SpurGear& gear, const DynamicsVars& dynVars, const std::string& filename) {
+    std::ofstream outFile(filename);
+    if (!outFile.is_open()) {
+        std::cerr << "Failed to open file " << filename << " for writing." << std::endl;
+        return;
+    }
+
+    // Write header: tooth index, profile point index, x_left, y_left, x_right, y_right
+    outFile << "Tooth,ProfilePoint,x_left,y_left,x_right,y_right\n";
+
+    // Loop over each tooth (column) and each profile point (row)
+    for (int tooth = 0; tooth < gear.numTeeth; tooth++) {
+        for (int i = 0; i < dynVars.n; i++) {
+            // Assuming your complete gear profile is stored in initialToothProfileXLeft, etc.
+            outFile << tooth << "," << i << ","
+                << gear.initialToothProfileXLeft[tooth][i] << ","
+                << gear.initialToothProfileYLeft[tooth][i] << ","
+                << gear.initialToothProfileXRight[tooth][i] << ","
+                << gear.initialToothProfileYRight[tooth][i] << "\n";
+        }
+    }
+    outFile.close();
+    std::cout << "Gear profile data written to " << filename << std::endl;
+}
+
 void startupmsg() {
     cout << " Physics 5810 - Computational Physics Final Project " << endl;
     cout << " ----------------- Nick Hutchison ----------------- " << endl;
@@ -442,9 +467,8 @@ int setupProfiles(SpurGear* pinion, SpurGear* gear, DynamicsVars* dynamicvars) {
     //#define f4(F_gear_sx, F_gear_1x, F_gear_2x, F_gear_3x, F_gear_4x) (F_gear_sx - F_gear_1x - F_gear_2x - F_gear_3x - F_gear_4x)
     //#define f5(F_gear_sy, F_gear_1y, F_gear_2y, F_gear_3y, F_gear_4y) (F_gear_sy - F_gear_1y - F_gear_2y - F_gear_3y - F_gear_4y - m_gear * dynamicvars->g)
     //#define f6(T_gear_1, T_gear_2, T_gear_3, T_gear_4, T_l) (T_gear_1 + T_gear_2 + T_gear_3 + T_gear_4 + T_l)
-    
-    dynamicvars->n = 100;			                        // number points per profile
-    pinion->theta_e = M_PI / pinion->numTeeth;              // Angular pitch
+    dynamicvars->n = 100;			// number points per profile
+    pinion->theta_e = M_PI / pinion->numTeeth; // Angular pitch
     gear->theta_e = M_PI / gear->numTeeth;
     pinion->theta_a = computeThetaA(pinion->pressureAngle); // Roll angle to the pitch point
     gear->theta_a = computeThetaA(gear->pressureAngle);
@@ -540,6 +564,7 @@ void initialToothPinion(SpurGear* pinion, DynamicsVars* dynamicvars) {
         return;
     }
 
+
     for (int i = 0; i < dynamicvars->n; i++) {
         pinion->initial_position_x_left[i]  = cos(-1.0 * pinion->theta_r) * pinion->position_x_left[i]  - sin(-1.0 * pinion->theta_r) * pinion->position_y_left[i];
         pinion->initial_position_y_left[i]  = sin(-1.0 * pinion->theta_r) * pinion->position_x_left[i]  + cos(-1.0 * pinion->theta_r) * pinion->position_y_left[i];
@@ -584,13 +609,12 @@ void completePinionProfile(SpurGear* pinion, DynamicsVars* dynamicvars) {
     for (int i = 0; i < pinion->numTeeth; i++) {
         double angle = 2 * i * pinion->theta_e;
         for (int j = 0; j < dynamicvars->n; j++) {
-            pinion->initialToothProfileXLeft[i][j]  = cos(angle) * pinion->initial_position_x_left[j]  - sin(angle) * pinion->initial_position_y_left[j];
-            pinion->initialToothProfileYLeft[i][j]  = sin(angle) * pinion->initial_position_x_left[j]  + cos(angle) * pinion->initial_position_y_left[j];
+            pinion->initialToothProfileXLeft[i][j] = cos(angle) * pinion->initial_position_x_left[j] - sin(angle) * pinion->initial_position_y_left[j];
+            pinion->initialToothProfileYLeft[i][j] = sin(angle) * pinion->initial_position_x_left[j] + cos(angle) * pinion->initial_position_y_left[j];
             pinion->initialToothProfileXRight[i][j] = cos(angle) * pinion->initial_position_x_right[j] - sin(angle) * pinion->initial_position_y_right[j];
             pinion->initialToothProfileYRight[i][j] = sin(angle) * pinion->initial_position_x_right[j] + cos(angle) * pinion->initial_position_y_right[j];
         }
     }
-
     outputGearProfile(*pinion, *dynamicvars, "pinionProfile.csv");
     return;
 }
@@ -604,8 +628,8 @@ void completeGearProfile(SpurGear* gear, DynamicsVars* dynamicvars) {
     for (int i = 0; i < gear->numTeeth; i++) {
         double angle = 2.0 * i * gear->theta_e;
         for (int j = 0; j < dynamicvars->n; j++) {
-            gear->initialToothProfileXLeft[i][j]  = cos(angle) * gear->initial_position_x_left[j]  - sin(angle) * gear->initial_position_y_left[j] + gear->centerDistance;
-            gear->initialToothProfileYLeft[i][j]  = sin(angle) * gear->initial_position_x_left[j]  + cos(angle) * gear->initial_position_y_left[j];
+            gear->initialToothProfileXLeft[i][j] = cos(angle) * gear->initial_position_x_left[j] - sin(angle) * gear->initial_position_y_left[j] + gear->centerDistance;
+            gear->initialToothProfileYLeft[i][j] = sin(angle) * gear->initial_position_x_left[j] + cos(angle) * gear->initial_position_y_left[j];
             gear->initialToothProfileXRight[i][j] = cos(angle) * gear->initial_position_x_right[j] - sin(angle) * gear->initial_position_y_right[j] + gear->centerDistance;
             gear->initialToothProfileYRight[i][j] = sin(angle) * gear->initial_position_x_right[j] + cos(angle) * gear->initial_position_y_right[j];
         }
@@ -1186,33 +1210,4 @@ double getMeshDampingCoeff(double kv, double zeta, double m_pinion, double m_gea
 double computeMoment(const Vec2D& contactPoint, const Vec2D& centerPoint, const Vec2D& forceVector) {
     Vec2D r = contactPoint - centerPoint; // Lever arm vector
     return r.x * forceVector.y - r.y * forceVector.x; // Units: m * N = Nm
-}
-
-
-// Debug Functions
-void outputGearProfile(const SpurGear& gear, const DynamicsVars& dynVars, const string& filename) {
-    // Output gear profile to then plot in MATLAB
-
-    ofstream outFile(filename);
-    if (!outFile.is_open()) {
-        cerr << "Failed to open file " << filename << " for writing." << endl;
-        return;
-    }
-
-    // Write header: tooth index, profile point index, x_left, y_left, x_right, y_right
-    outFile << "Tooth,ProfilePoint,x_left,y_left,x_right,y_right\n";
-
-    // Loop over each tooth (column) and each profile point (row)
-    for (int tooth = 0; tooth < gear.numTeeth; tooth++) {
-        for (int i = 0; i < dynVars.n; i++) {
-            // Assuming your complete gear profile is stored in initialToothProfileXLeft, etc.
-            outFile << tooth << "," << i << ","
-                << gear.initialToothProfileXLeft[tooth][i] << ","
-                << gear.initialToothProfileYLeft[tooth][i] << ","
-                << gear.initialToothProfileXRight[tooth][i] << ","
-                << gear.initialToothProfileYRight[tooth][i] << "\n";
-        }
-    }
-    outFile.close();
-    cout << "Gear profile data written to " << filename << endl;
 }
